@@ -1,0 +1,8 @@
+node_modules/
+dist/
+coverage/
+.orchestration/worktrees/
+.orchestration/tmp/
+.orchestration/.codex-sqlite/
+*.log
+tmp/
