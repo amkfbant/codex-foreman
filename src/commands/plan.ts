@@ -4,7 +4,7 @@ import type { CodexExec } from "../codex.js";
 import { makePlanFromSpec, makeWorkItemFromGoal } from "../controller.js";
 import { readWorkItems, writeAgentRun, writePlan, writeWorkItem } from "../state/store.js";
 import { ForemanError } from "../utils/errors.js";
-import { readText } from "../utils/fs.js";
+import { pathExists, readText } from "../utils/fs.js";
 import { makeId } from "../utils/time.js";
 
 export async function planCommand(projectPath: string, specPath: string, options: { codex?: CodexExec } = {}): Promise<string[]> {
@@ -42,6 +42,7 @@ async function writeDerivedPlan(
   const existing = await readWorkItems(projectPath);
   const planUid = makeId("PLAN");
   const goal = extractGoal(spec);
+  const catalogCommands = await validationCommandsFromCatalog(projectPath);
   const items = derived.map((derivedItem, index) => {
     const uid = makeId("WI", existing.length + index + 1);
     const item = makeWorkItemFromGoal(uid, slugify(derivedItem.name), derivedItem.goal, planUid);
@@ -49,6 +50,11 @@ async function writeDerivedPlan(
     item.spec.acceptanceCriteria = derivedItem.acceptanceCriteria.length
       ? derivedItem.acceptanceCriteria.map((text, criterionIndex) => ({ id: `AC-${criterionIndex + 1}`, text }))
       : item.spec.acceptanceCriteria;
+    item.spec.contextPaths = derivedItem.contextPaths;
+    item.spec.allowedPaths = derivedItem.allowedPaths;
+    item.spec.validationCommands = derivedItem.validationCommands.length
+      ? derivedItem.validationCommands
+      : catalogCommands;
     item.spec.risk = derivedItem.risk;
     return item;
   });
@@ -94,6 +100,9 @@ type DerivedWorkItem = {
   constraints: string[];
   acceptanceCriteria: string[];
   dependencies: string[];
+  validationCommands: string[];
+  contextPaths: string[];
+  allowedPaths: string[];
   risk: "low" | "medium" | "high";
 };
 
@@ -113,6 +122,9 @@ function deriveWorkItems(markdown: string): DerivedWorkItem[] {
       constraints: extractList(markdown, "Constraints"),
       acceptanceCriteria: extractList(markdown, "Acceptance Criteria"),
       dependencies: [],
+      validationCommands: extractValidationCommands(markdown),
+      contextPaths: extractList(markdown, "Context Paths"),
+      allowedPaths: extractList(markdown, "Allowed Paths"),
       risk: inferRisk(markdown)
     }];
   }
@@ -126,6 +138,9 @@ function deriveWorkItems(markdown: string): DerivedWorkItem[] {
       constraints: extractList(markdown, "Constraints"),
       acceptanceCriteria: extractList(markdown, "Acceptance Criteria"),
       dependencies: [],
+      validationCommands: extractValidationCommands(markdown),
+      contextPaths: extractList(markdown, "Context Paths"),
+      allowedPaths: extractList(markdown, "Allowed Paths"),
       risk: inferRisk(candidate)
     };
   });
@@ -139,6 +154,28 @@ function extractList(markdown: string, heading: string): string[] {
     .filter((value): value is string => Boolean(value)) ?? [];
 }
 
+function extractValidationCommands(markdown: string): string[] {
+  return [
+    ...extractList(markdown, "Validation Commands"),
+    ...extractList(markdown, "Validation")
+  ].map((command) => command.replace(/^`|`$/g, ""));
+}
+
+async function validationCommandsFromCatalog(projectPath: string): Promise<string[]> {
+  const catalogPath = path.join(projectPath, ".orchestration", "project", "validation-catalog.json");
+  if (await pathExists(catalogPath)) {
+    const raw = JSON.parse(await readText(catalogPath)) as { commands?: unknown[] };
+    return (raw.commands ?? []).map((entry) => {
+      if (typeof entry === "string") return entry;
+      if (entry && typeof entry === "object") return String((entry as Record<string, unknown>).command ?? "");
+      return "";
+    }).filter(Boolean);
+  }
+  const matrixPath = path.join(projectPath, ".orchestration", "project", "validation-matrix.md");
+  if (!(await pathExists(matrixPath))) return [];
+  return [...(await readText(matrixPath)).matchAll(/`([^`]+)`/g)].map((match) => match[1]).filter((value): value is string => Boolean(value));
+}
+
 function inferRisk(text: string): "low" | "medium" | "high" {
   return /auth|security|billing|payment|migration|credential|secret/i.test(text) ? "high" : "medium";
 }
@@ -147,7 +184,7 @@ function renderManagerPrompt(spec: string): string {
   return [
     "You are the manager worker for Codex Foreman.",
     "Decompose this Markdown specification into WorkItems.",
-    "Return JSON only: {\"workitems\":[{\"name\":\"...\",\"goal\":\"...\",\"constraints\":[],\"acceptanceCriteria\":[],\"dependencies\":[],\"risk\":\"low|medium|high\"}]}",
+    "Return JSON only: {\"workitems\":[{\"name\":\"...\",\"goal\":\"...\",\"constraints\":[],\"acceptanceCriteria\":[],\"dependencies\":[],\"validationCommands\":[],\"contextPaths\":[],\"allowedPaths\":[],\"risk\":\"low|medium|high\"}]}",
     "",
     spec
   ].join("\n");
@@ -167,6 +204,9 @@ async function readManagerPlan(filePath: string): Promise<DerivedWorkItem[]> {
         constraints: Array.isArray(record.constraints) ? record.constraints.map(String) : [],
         acceptanceCriteria: Array.isArray(record.acceptanceCriteria) ? record.acceptanceCriteria.map(String) : [],
         dependencies: Array.isArray(record.dependencies) ? record.dependencies.map(String) : [],
+        validationCommands: Array.isArray(record.validationCommands) ? record.validationCommands.map(String) : [],
+        contextPaths: Array.isArray(record.contextPaths) ? record.contextPaths.map(String) : [],
+        allowedPaths: Array.isArray(record.allowedPaths) ? record.allowedPaths.map(String) : [],
         risk: record.risk === "low" || record.risk === "high" ? record.risk : "medium"
       };
     });

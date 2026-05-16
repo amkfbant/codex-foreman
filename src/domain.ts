@@ -230,7 +230,8 @@ export const patchCandidateSchema = z.object({
     worktree: z.string(),
     branch: z.string(),
     candidateDir: z.string(),
-    variant: z.string()
+    variant: z.string(),
+    baseHead: z.string().optional()
   }),
   status: z.object({
     phase: z.enum(["Created", "Implemented", "Validated", "Reviewing", "Reviewed", "Repairing", "Selected", "Rejected", "Merged"]),

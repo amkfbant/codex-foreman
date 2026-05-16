@@ -12,7 +12,7 @@ import { dashboardCommand } from "../src/commands/dashboard.js";
 import { eventsCommand } from "../src/commands/events.js";
 import { reconcileOnce } from "../src/controller.js";
 import { tryAcquireLease, releaseLease } from "../src/lease.js";
-import { readConfig, readPatchCandidates, readWorkItems, writeConfig, writeWorkItem } from "../src/state/store.js";
+import { readConfig, readPatchCandidates, readWorkItems, writeConfig, writePatchCandidate, writeWorkItem } from "../src/state/store.js";
 import { pathExists, writeTextAtomic } from "../src/utils/fs.js";
 import { tempRepo } from "./helpers.js";
 
@@ -64,12 +64,13 @@ describe("reconcile flow", () => {
 
   it("moves to Repairing when validation fails and retries remain", async () => {
     const repo = await tempRepo();
+    await writeNodeValidationProject(repo, "process.exit(1)");
     await installCommand(repo, { mode: "existing", overwrite: "safe", maxCoders: 3, maxReviewers: 2 });
     await writeTextAtomic(path.join(repo, "feature.md"), "# Feature\n\n## Goal\nAdd a tiny feature.\n");
     await planCommand(repo, "feature.md");
     const [item] = await readWorkItems(repo);
     if (!item) throw new Error("expected WorkItem");
-    item.spec.validationCommands = ["node -e \"process.exit(1)\""];
+    item.spec.validationCommands = ["npm test"];
     await writeWorkItem(repo, item);
 
     await reconcileOnce(repo);
@@ -183,6 +184,173 @@ describe("reconcile flow", () => {
     expect(candidates[0]?.status.changedFiles).not.toContain("coverage.txt");
   });
 
+  it("rejects candidates when validation mutates the staged snapshot", async () => {
+    const repo = await tempRepo();
+    await writeNodeValidationProject(
+      repo,
+      "require('node:fs').writeFileSync('coverage.txt','generated\\n');require('node:child_process').execFileSync('git',['add','coverage.txt'])"
+    );
+    await installCommand(repo, { mode: "existing", overwrite: "safe", maxCoders: 1, maxReviewers: 1 });
+    const config = await readConfig(repo);
+    config.candidatePolicy.maxCandidates = 1;
+    await writeConfig(repo, config);
+    await writeTextAtomic(path.join(repo, "feature.md"), "# Feature\n\n## Goal\nModify README.\n");
+    await planCommand(repo, "feature.md");
+    await setValidation(repo, "npm test");
+
+    const codex = new MutatingCodexExec(async (request) => {
+      if (request.role === "coder") await appendFile(path.join(request.cwd, "README.md"), "\nvalidated change\n", "utf8");
+    });
+
+    await reconcileOnce(repo, { codex });
+    await reconcileOnce(repo, { codex });
+    const result = await reconcileOnce(repo, { codex });
+
+    expect(result.phase).toBe("Blocked");
+    const [item] = await readWorkItems(repo);
+    if (!item) throw new Error("expected WorkItem");
+    expect(item.status.failureReason).toBe("ValidationMutatedIndex");
+    const candidates = await readPatchCandidates(repo, item.metadata.uid);
+    expect(candidates[0]?.status.phase).toBe("Rejected");
+    expect(candidates[0]?.status.changedFiles).not.toContain("coverage.txt");
+  });
+
+  it("rejects validation that hides an extra commit behind the staged snapshot", async () => {
+    const repo = await tempRepo();
+    await writeNodeValidationProject(
+      repo,
+      [
+        "const cp=require('node:child_process')",
+        "const fs=require('node:fs')",
+        "const patch=cp.execFileSync('git',['diff','--cached','--binary'])",
+        "cp.execFileSync('git',['reset'])",
+        "fs.writeFileSync('hidden.txt','hidden\\n')",
+        "cp.execFileSync('git',['add','hidden.txt'])",
+        "cp.execFileSync('git',['commit','-m','hidden validation commit'])",
+        "cp.spawnSync('git',['apply','--cached'],{input:patch})"
+      ].join(";")
+    );
+    await installCommand(repo, { mode: "existing", overwrite: "safe", maxCoders: 1, maxReviewers: 1 });
+    const config = await readConfig(repo);
+    config.candidatePolicy.maxCandidates = 1;
+    await writeConfig(repo, config);
+    await writeTextAtomic(path.join(repo, "feature.md"), "# Feature\n\n## Goal\nModify README.\n");
+    await planCommand(repo, "feature.md");
+    await setValidation(repo, "npm test");
+
+    const codex = new MutatingCodexExec(async (request) => {
+      if (request.role === "coder") await appendFile(path.join(request.cwd, "README.md"), "\nvisible change\n", "utf8");
+    });
+
+    await reconcileOnce(repo, { codex });
+    await reconcileOnce(repo, { codex });
+    const result = await reconcileOnce(repo, { codex });
+
+    expect(result.phase).toBe("Blocked");
+    const [item] = await readWorkItems(repo);
+    expect(item?.status.failureReason).toBe("CandidateHeadMoved");
+  });
+
+  it("does not block on controller-owned tracked state updates", async () => {
+    const repo = await tempRepo();
+    await installCommand(repo, { mode: "existing", overwrite: "safe", maxCoders: 1, maxReviewers: 1 });
+    const config = await readConfig(repo);
+    config.candidatePolicy.maxCandidates = 1;
+    await writeConfig(repo, config);
+    await writeTextAtomic(path.join(repo, "feature.md"), "# Feature\n\n## Goal\nModify README.\n");
+    await planCommand(repo, "feature.md");
+    await setValidation(repo, "git status --short");
+    await execa("git", ["add", "-f", "AGENTS.md", ".codex", ".agents", ".orchestration", "feature.md"], { cwd: repo });
+    await execa("git", ["commit", "-m", "track orchestration state"], { cwd: repo });
+
+    expect((await reconcileOnce(repo)).phase).toBe("Ready");
+    const result = await reconcileOnce(repo);
+
+    expect(result.phase).toBe("Validating");
+  });
+
+  it("blocks before ReadyToMerge when merge readiness guards fail", async () => {
+    const repo = await tempRepo();
+    await installCommand(repo, { mode: "existing", overwrite: "safe", maxCoders: 1, maxReviewers: 1 });
+    const config = await readConfig(repo);
+    config.candidatePolicy.maxCandidates = 1;
+    await writeConfig(repo, config);
+    await writeTextAtomic(path.join(repo, "feature.md"), "# Feature\n\n## Goal\nModify dependency metadata.\n");
+    await planCommand(repo, "feature.md");
+    await setValidation(repo, "git status --short");
+    const codex = new MutatingCodexExec(async (request) => {
+      if (request.role === "coder") await writeFile(path.join(request.cwd, "package.json"), "{\"scripts\":{\"test\":\"node --version\"}}\n", "utf8");
+    });
+
+    await reconcileOnce(repo, { codex });
+    await reconcileOnce(repo, { codex });
+    await reconcileOnce(repo, { codex });
+    const result = await reconcileOnce(repo, { codex });
+
+    expect(result.phase).toBe("Blocked");
+    const [item] = await readWorkItems(repo);
+    expect(item?.status.failureReason).toBe("MergeReadinessBlocked");
+  });
+
+  it("refreshes the real candidate snapshot before ReadyToMerge guards", async () => {
+    const repo = await tempRepo();
+    await installCommand(repo, { mode: "existing", overwrite: "safe", maxCoders: 1, maxReviewers: 1 });
+    const config = await readConfig(repo);
+    config.candidatePolicy.maxCandidates = 1;
+    await writeConfig(repo, config);
+    await writeTextAtomic(path.join(repo, "feature.md"), "# Feature\n\n## Goal\nModify dependency metadata.\n");
+    await planCommand(repo, "feature.md");
+    await setValidation(repo, "git status --short");
+    const codex = new MutatingCodexExec(async (request) => {
+      if (request.role === "coder") {
+        await appendFile(path.join(request.cwd, "README.md"), "\nstale status guard\n", "utf8");
+        await writeFile(path.join(request.cwd, "package.json"), "{\"scripts\":{\"test\":\"node --version\"}}\n", "utf8");
+      }
+    });
+
+    await reconcileOnce(repo, { codex });
+    await reconcileOnce(repo, { codex });
+    await reconcileOnce(repo, { codex });
+    const [item] = await readWorkItems(repo);
+    if (!item) throw new Error("expected WorkItem");
+    const [candidate] = await readPatchCandidates(repo, item.metadata.uid);
+    if (!candidate) throw new Error("expected candidate");
+    candidate.status.changedFiles = ["README.md"];
+    await writePatchCandidate(repo, candidate);
+
+    const result = await reconcileOnce(repo, { codex });
+
+    expect(result.phase).toBe("Blocked");
+    const [updated] = await readWorkItems(repo);
+    expect(updated?.status.failureReason).toBe("MergeReadinessBlocked");
+    const [updatedCandidate] = await readPatchCandidates(repo, item.metadata.uid);
+    expect(updatedCandidate?.status.changedFiles).toContain("package.json");
+  });
+
+  it("rejects reviewer hidden commits before ReadyToMerge", async () => {
+    const repo = await tempRepo();
+    await installCommand(repo, { mode: "existing", overwrite: "safe", maxCoders: 1, maxReviewers: 1 });
+    const config = await readConfig(repo);
+    config.candidatePolicy.maxCandidates = 1;
+    await writeConfig(repo, config);
+    await writeTextAtomic(path.join(repo, "feature.md"), "# Feature\n\n## Goal\nModify README.\n");
+    await planCommand(repo, "feature.md");
+    await setValidation(repo, "git status --short");
+    const codex = new MutatingCodexExec(async (request) => {
+      if (request.role === "coder") await appendFile(path.join(request.cwd, "README.md"), "\nreview hidden base\n", "utf8");
+      if (request.role === "reviewer") await hideCommitBehindStagedPatch(request.cwd, "review-hidden.txt");
+    });
+
+    await reconcileOnce(repo, { codex });
+    await reconcileOnce(repo, { codex });
+    await reconcileOnce(repo, { codex });
+    const result = await reconcileOnce(repo, { codex });
+
+    expect(result.phase).toBe("Blocked");
+    const [item] = await readWorkItems(repo);
+    expect(item?.status.failureReason).toBe("CandidateHeadMoved");
+  });
+
   it("validates in a temporary integration worktree before changing main", async () => {
     const repo = await tempRepo();
     await writeNodeValidationProject(repo, "require('node:fs').existsSync('FAIL') && process.exit(1)");
@@ -215,6 +383,92 @@ describe("reconcile flow", () => {
     expect(result.phase).toBe("Blocked");
     expect(mainHeadAfterMergeAttempt).toBe(mainHeadBeforeMerge);
     await expect(readFile(path.join(repo, "README.md"), "utf8")).resolves.not.toContain("integration candidate");
+  });
+
+  it("rejects staged mutations from integration validation before changing main", async () => {
+    const repo = await tempRepo();
+    await writeNodeValidationProject(
+      repo,
+      "if(require('node:fs').existsSync('INTEGRATION_STAGE')){require('node:fs').writeFileSync('coverage.txt','generated');require('node:child_process').execFileSync('git',['add','coverage.txt'])}"
+    );
+    await installCommand(repo, { mode: "existing", overwrite: "safe", maxCoders: 1, maxReviewers: 1 });
+    const config = await readConfig(repo);
+    config.autoMerge.enabled = true;
+    config.candidatePolicy.maxCandidates = 1;
+    await writeConfig(repo, config);
+    await writeTextAtomic(path.join(repo, "feature.md"), "# Feature\n\n## Goal\nModify README.\n");
+    await planCommand(repo, "feature.md");
+    await setValidation(repo, "npm test");
+
+    const codex = new MutatingCodexExec(async (request) => {
+      if (request.role === "coder") await appendFile(path.join(request.cwd, "README.md"), "\nintegration staged candidate\n", "utf8");
+    });
+
+    await reconcileOnce(repo, { codex });
+    await reconcileOnce(repo, { codex });
+    await reconcileOnce(repo, { codex });
+    await reconcileOnce(repo, { codex });
+
+    await writeFile(path.join(repo, "INTEGRATION_STAGE"), "stage during integration\n", "utf8");
+    await execa("git", ["add", "INTEGRATION_STAGE"], { cwd: repo });
+    await execa("git", ["commit", "-m", "add integration staging marker"], { cwd: repo });
+    const mainHeadBeforeMerge = (await execa("git", ["rev-parse", "HEAD"], { cwd: repo })).stdout.trim();
+
+    const result = await reconcileOnce(repo, { codex });
+    const mainHeadAfterMergeAttempt = (await execa("git", ["rev-parse", "HEAD"], { cwd: repo })).stdout.trim();
+
+    expect(result.phase).toBe("Blocked");
+    const [item] = await readWorkItems(repo);
+    expect(item?.status.failureReason).toBe("IntegrationValidationMutatedIndex");
+    expect(mainHeadAfterMergeAttempt).toBe(mainHeadBeforeMerge);
+    await expect(pathExists(path.join(repo, "coverage.txt"))).resolves.toBe(false);
+  });
+
+  it("rejects hidden commits from integration validation before changing main", async () => {
+    const repo = await tempRepo();
+    await writeNodeValidationProject(
+      repo,
+      [
+        "if(require('node:fs').existsSync('INTEGRATION_COMMIT')){",
+        "const cp=require('node:child_process')",
+        "const fs=require('node:fs')",
+        "fs.writeFileSync('hidden-integration.txt','hidden\\n')",
+        "cp.execFileSync('git',['add','hidden-integration.txt'])",
+        "cp.execFileSync('git',['commit','-m','hidden integration commit'])",
+        "}"
+      ].join(";")
+    );
+    await installCommand(repo, { mode: "existing", overwrite: "safe", maxCoders: 1, maxReviewers: 1 });
+    const config = await readConfig(repo);
+    config.autoMerge.enabled = true;
+    config.candidatePolicy.maxCandidates = 1;
+    await writeConfig(repo, config);
+    await writeTextAtomic(path.join(repo, "feature.md"), "# Feature\n\n## Goal\nModify README.\n");
+    await planCommand(repo, "feature.md");
+    await setValidation(repo, "npm test");
+
+    const codex = new MutatingCodexExec(async (request) => {
+      if (request.role === "coder") await appendFile(path.join(request.cwd, "README.md"), "\nintegration hidden candidate\n", "utf8");
+    });
+
+    await reconcileOnce(repo, { codex });
+    await reconcileOnce(repo, { codex });
+    await reconcileOnce(repo, { codex });
+    await reconcileOnce(repo, { codex });
+
+    await writeFile(path.join(repo, "INTEGRATION_COMMIT"), "commit during integration\n", "utf8");
+    await execa("git", ["add", "INTEGRATION_COMMIT"], { cwd: repo });
+    await execa("git", ["commit", "-m", "add integration commit marker"], { cwd: repo });
+    const mainHeadBeforeMerge = (await execa("git", ["rev-parse", "HEAD"], { cwd: repo })).stdout.trim();
+
+    const result = await reconcileOnce(repo, { codex });
+    const mainHeadAfterMergeAttempt = (await execa("git", ["rev-parse", "HEAD"], { cwd: repo })).stdout.trim();
+
+    expect(result.phase).toBe("Blocked");
+    const [item] = await readWorkItems(repo);
+    expect(item?.status.failureReason).toBe("IntegrationValidationMovedHead");
+    expect(mainHeadAfterMergeAttempt).toBe(mainHeadBeforeMerge);
+    await expect(pathExists(path.join(repo, "hidden-integration.txt"))).resolves.toBe(false);
   });
 
   it("does not mark failed Codex runs as implemented", async () => {
@@ -278,6 +532,12 @@ async function writeNodeValidationProject(repo: string, script: string): Promise
   }, null, 2)}\n`, "utf8");
   await execa("git", ["add", "package.json"], { cwd: repo });
   await execa("git", ["commit", "-m", "add validation script"], { cwd: repo });
+}
+
+async function hideCommitBehindStagedPatch(cwd: string, hiddenFile: string): Promise<void> {
+  await writeFile(path.join(cwd, hiddenFile), "hidden\n", "utf8");
+  await execa("git", ["add", hiddenFile], { cwd });
+  await execa("git", ["commit", "--only", hiddenFile, "-m", `hidden ${hiddenFile}`], { cwd });
 }
 
 class MutatingCodexExec implements CodexExec {

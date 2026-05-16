@@ -12,13 +12,14 @@ CLI には、実装計画書内の例と互換にするため `codex-orchestrato
 - `install` で orchestration 用の設定、skill、state ディレクトリを生成
 - conservative rules と各種 schema を生成
 - `init` でリポジトリ構造、検証コマンド候補、リスク情報を静的に分析
-- `plan` で Markdown spec から複数の `WorkItem` を生成
+- `plan` で Markdown spec から複数の `WorkItem` を生成し、`init` が作る `validation-catalog.json` から検証コマンドを引き継ぐ
 - `reconcile --once` で WorkItem を1段階ずつ進める
 - Codex 実行境界を adapter 化し、既定では deterministic な fake adapter を使用
 - XML と JSON sidecar の両方で状態を保存し、不一致があれば `StateFormatMismatch` として停止
 - git worktree を使って複数candidateを隔離
 - validation、review、diff size、protected path、dependency file変更、repair回数でcandidateをscore
 - validation、review、repair、ガード付き auto-merge の基本フローを実装
+- validation が staged patch や worktree を変更した candidate は reject
 - `events` と静的HTML `dashboard` を生成
 
 ## セットアップ
@@ -105,6 +106,7 @@ codex-foreman status /path/to/project
 
 - `.orchestration/config.xml` / `.orchestration/config.json`: controller 設定
 - `.orchestration/desired/plan.xml` / `.orchestration/desired/plan.json`: 目標状態
+- `.orchestration/project/validation-catalog.json`: `init` が検出した検証コマンド候補
 - `.orchestration/workitems/*.xml` / `*.json`: WorkItem 状態
 - `.orchestration/runs/`: Codex JSONL と AgentRun XML/JSON
 - `.orchestration/candidates/`: 候補差分、検証ログ、レビュー結果、score
@@ -113,6 +115,10 @@ codex-foreman status /path/to/project
 - `.orchestration/worktrees/`: worker 用 git worktree
 
 XML と JSON sidecar は同じ意味内容である必要があります。差分がある場合、controller は状態を壊さず停止します。
+
+`.orchestration/workitems`、`candidates`、`runs`、`events`、`locks`、`leases`、`worktrees`、`dashboard` は controller が更新する runtime state です。`install` はこれらを対象リポジトリの `.git/info/exclude` に追加します。設定、project 情報、knowledge、plan は必要に応じて Git 管理できますが、runtime state は明示的な運用を決めない限り commit しない前提です。
+
+validation command は制限されています。既定では package manager の test/lint/build 系コマンドと read-only な Git コマンドのみを許可し、`git add`、`git reset`、`git clean`、`git push`、直接の `node -e` validation などは拒否します。
 
 ## Codex 実行モード
 

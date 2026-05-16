@@ -127,10 +127,13 @@ This directory stores Codex Foreman desired state, observed state, run logs, can
 
 - \`config.xml\` and \`config.json\` configure the controller.
 - \`desired/plan.xml\` and \`desired/plan.json\` describe the active plan.
+- \`project/validation-catalog.json\` stores machine-readable validation command candidates detected by init.
 - \`workitems/*.xml\` and matching \`*.json\` files are controller objects.
 - \`runs/\` stores Codex JSONL logs.
 - \`candidates/\` stores candidate reports, patches, validation logs, and reviews.
 - \`knowledge/\` stores durable human-readable project knowledge.
+
+Runtime state under \`workitems/\`, \`candidates/\`, \`runs/\`, \`events/\`, \`locks/\`, \`leases/\`, \`worktrees/\`, and \`dashboard/\` is local mutable controller state and is added to \`.git/info/exclude\` by the installer.
 `;
 }
 
@@ -217,6 +220,9 @@ export function managerPlanSchemaTemplate(): string {
             constraints: { type: "array", items: { type: "string" } },
             acceptanceCriteria: { type: "array", items: { type: "string" } },
             dependencies: { type: "array", items: { type: "string" } },
+            validationCommands: { type: "array", items: { type: "string" } },
+            contextPaths: { type: "array", items: { type: "string" } },
+            allowedPaths: { type: "array", items: { type: "string" } },
             risk: { enum: ["low", "medium", "high"] }
           }
         }

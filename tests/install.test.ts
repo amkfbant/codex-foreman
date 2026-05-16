@@ -22,6 +22,7 @@ describe("install command", () => {
     await expect(pathExists(path.join(repo, ".agents/skills/orchestration-init/SKILL.md"))).resolves.toBe(true);
     await expect(pathExists(path.join(repo, ".orchestration/schemas/PatchCandidate.schema.json"))).resolves.toBe(true);
     await expect(pathExists(path.join(repo, ".orchestration/schemas/coder-result.schema.json"))).resolves.toBe(true);
+    await expect(pathExists(path.join(repo, ".orchestration/project/validation-catalog.json"))).resolves.toBe(true);
   });
 
   it("uses patch files instead of overwriting existing managed files in safe mode", async () => {

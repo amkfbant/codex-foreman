@@ -22,8 +22,8 @@ export async function isGitRepo(projectPath: string): Promise<boolean> {
   return result.exitCode === 0 && result.stdout.trim() === "true";
 }
 
-export async function currentHead(projectPath: string): Promise<string> {
-  const result = await git(projectPath, ["rev-parse", "HEAD"]);
+export async function currentHead(projectPath: string, cwd = projectPath): Promise<string> {
+  const result = await git(projectPath, ["rev-parse", "HEAD"], { cwd });
   if (result.exitCode !== 0) {
     throw new ForemanError("GitError", result.all ?? "Unable to resolve HEAD.");
   }

@@ -12,7 +12,7 @@ import {
   reviewReportSchema,
   type WorkItem
 } from "./domain.js";
-import { cp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { cp, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { appendEvent } from "./events.js";
 import {
   branchForWorktree,
@@ -199,7 +199,9 @@ async function runCoder(projectPath: string, item: WorkItem, codex: CodexExec): 
         const candidatePath = path.join(projectPath, candidate.spec.candidateDir);
         await ensureDir(candidatePath);
         await createWorktree(projectPath, worktreePath, candidate.spec.branch);
-        await installWorkerContext(projectPath, worktreePath);
+        candidate.spec.baseHead = await currentHead(projectPath, worktreePath);
+        const copiedContext = await installWorkerContext(projectPath, worktreePath);
+        await writeTextAtomic(path.join(candidatePath, "worker-context.json"), `${JSON.stringify({ copied: copiedContext }, null, 2)}\n`);
         await writePatchCandidate(projectPath, candidate);
         const run = await codex.run({
           projectPath,
@@ -213,6 +215,7 @@ async function runCoder(projectPath: string, item: WorkItem, codex: CodexExec): 
         });
         await writeAgentRun(projectPath, run);
         assertRunSucceeded(run);
+        await assertCandidateHeadUnmoved(projectPath, candidate, worktreePath, "coder");
         await cleanWorkerContext(projectPath, worktreePath);
         const materializedFiles = await materializeCandidate(projectPath, worktreePath);
         const scopeViolations = outsideAllowedPaths(item, materializedFiles);
@@ -280,6 +283,10 @@ async function runValidation(projectPath: string, config: OrchestrationConfig, i
     const logs: string[] = [];
     const commandResults: PatchCandidate["status"]["validation"]["commands"] = [];
     let failed = false;
+    await assertCandidateHeadUnmoved(projectPath, candidate, worktreePath, "validation");
+    const cachedPatchBefore = await diff(projectPath, worktreePath);
+    const cachedFilesBefore = await changedFiles(projectPath, worktreePath);
+    const cachedDiffStatBefore = await diffStat(projectPath, worktreePath);
 
     if (item.spec.validationCommands.length === 0) {
       logs.push("No validation commands configured for this WorkItem.");
@@ -301,8 +308,22 @@ async function runValidation(projectPath: string, config: OrchestrationConfig, i
 
     let failureReason = failed ? "TestFailed" : undefined;
     if (item.spec.validationCommands.length > 0) {
+      try {
+        await assertCandidateHeadUnmoved(projectPath, candidate, worktreePath, "validation");
+      } catch (error) {
+        failed = true;
+        failureReason = "CandidateHeadMoved";
+        logs.push(errorMessage(error));
+      }
+      const cachedPatchAfter = await diff(projectPath, worktreePath);
       const validationDirtiedFiles = await unstagedOrUntrackedFiles(projectPath, worktreePath);
-      if (validationDirtiedFiles.length > 0) {
+      if (failureReason === "CandidateHeadMoved") {
+        logs.push("Validation moved the candidate branch HEAD; rejecting the candidate snapshot.");
+      } else if (cachedPatchAfter !== cachedPatchBefore) {
+        failed = true;
+        failureReason = "ValidationMutatedIndex";
+        logs.push("Validation changed the candidate index; rejecting the candidate snapshot.");
+      } else if (validationDirtiedFiles.length > 0) {
         failed = true;
         failureReason = "ValidationMutatedWorktree";
         logs.push(`Validation left unstaged or untracked changes: ${validationDirtiedFiles.join(", ")}`);
@@ -310,17 +331,21 @@ async function runValidation(projectPath: string, config: OrchestrationConfig, i
     }
 
     await writeTextAtomic(logPath, `${logs.join("\n\n")}\n`);
-    candidate.status.phase = failureReason === "ValidationMutatedWorktree" ? "Rejected" : "Validated";
+    candidate.status.phase = isValidationMutation(failureReason) ? "Rejected" : "Validated";
     candidate.status.validation = {
       status: failed ? "failed" : item.spec.validationCommands.length === 0 ? "skipped" : "passed",
       commands: commandResults,
       logPath: relativeTo(projectPath, logPath)
     };
-    candidate.status.changedFiles = await changedFiles(projectPath, worktreePath);
-    candidate.status.diffStat = await diffStat(projectPath, worktreePath);
+    candidate.status.changedFiles = isValidationMutation(failureReason)
+      ? cachedFilesBefore
+      : await changedFiles(projectPath, worktreePath);
+    candidate.status.diffStat = isValidationMutation(failureReason)
+      ? cachedDiffStatBefore
+      : await diffStat(projectPath, worktreePath);
     candidate.status.failureReason = failureReason;
     candidate.status.message = failed
-      ? failureReason === "ValidationMutatedWorktree"
+      ? isValidationMutation(failureReason)
         ? "Validation mutated the candidate worktree."
         : "Validation failed."
       : "Validation passed.";
@@ -340,7 +365,7 @@ async function runValidation(projectPath: string, config: OrchestrationConfig, i
 
   const allFailed = results.every((candidate) => candidate.status.validation.status === "failed");
   const allSkipped = results.every((candidate) => candidate.status.validation.status === "skipped");
-  const repairableFailures = results.filter((candidate) => candidate.status.failureReason !== "ValidationMutatedWorktree");
+  const repairableFailures = results.filter((candidate) => !isValidationMutation(candidate.status.failureReason));
   if (allSkipped) {
     item.status.phase = "Blocked";
     item.status.failureReason = "ValidationCommandMissing";
@@ -349,8 +374,8 @@ async function runValidation(projectPath: string, config: OrchestrationConfig, i
   } else if (allFailed) {
     if (repairableFailures.length === 0) {
       item.status.phase = "Blocked";
-      item.status.failureReason = "ValidationMutatedWorktree";
-      item.status.message = "All candidates left unstaged or untracked changes during validation.";
+      item.status.failureReason = results.find((candidate) => isValidationMutation(candidate.status.failureReason))?.status.failureReason;
+      item.status.message = "All candidates mutated the candidate snapshot during validation.";
     } else if (item.status.repairAttempts >= config.retryPolicy.maxRepairAttempts) {
       item.status.phase = "Blocked";
       item.status.failureReason = "TestFailed";
@@ -400,6 +425,8 @@ async function runReviewer(
         const validationLogPath = path.join(candidatePath, "validation.log");
         const validationLog = (await pathExists(validationLogPath)) ? await readText(validationLogPath) : "";
         const reviewOutputPath = path.join(candidatePath, "review-output.json");
+        await assertCandidateHeadUnmoved(projectPath, candidate, worktreePath, "review");
+        const patchBeforeReview = await diff(projectPath, worktreePath);
         const run = await codex.run({
           projectPath,
           cwd: worktreePath,
@@ -412,6 +439,18 @@ async function runReviewer(
         });
         await writeAgentRun(projectPath, run);
         assertRunSucceeded(run);
+        await assertCandidateHeadUnmoved(projectPath, candidate, worktreePath, "review");
+        const patchAfterReview = await diff(projectPath, worktreePath);
+        const dirtyAfterReview = await unstagedOrUntrackedFiles(projectPath, worktreePath);
+        if (patchAfterReview !== patchBeforeReview || dirtyAfterReview.length > 0) {
+          candidate.status.phase = "Rejected";
+          candidate.status.failureReason = patchAfterReview !== patchBeforeReview ? "ReviewerMutatedIndex" : "ReviewerMutatedWorktree";
+          candidate.status.message = patchAfterReview !== patchBeforeReview
+            ? "Reviewer changed the staged candidate snapshot."
+            : `Reviewer left unstaged or untracked changes: ${dirtyAfterReview.join(", ")}`;
+          await writePatchCandidate(projectPath, candidate);
+          throw new ForemanError(candidate.status.failureReason, candidate.status.message);
+        }
         let review: ReviewReport;
         try {
           review = await loadReviewOutput(reviewOutputPath, item.metadata.uid, candidate.metadata.uid);
@@ -451,12 +490,31 @@ async function runReviewer(
   item.status.activeWorktree = best.spec.worktree;
 
   if (best.status.reviewResult === "approve" && (best.status.score?.value ?? 0) >= config.candidatePolicy.minScoreToSelect) {
-    best.status.phase = "Selected";
+    const bestWorktreePath = path.join(projectPath, best.spec.worktree);
+    await assertCandidateHeadUnmoved(projectPath, best, bestWorktreePath, "merge readiness");
+    const finalDirty = await unstagedOrUntrackedFiles(projectPath, bestWorktreePath);
+    best.status.changedFiles = await changedFiles(projectPath, bestWorktreePath);
+    best.status.diffStat = await diffStat(projectPath, bestWorktreePath);
     await writePatchCandidate(projectPath, best);
-    item.status.phase = "ReadyToMerge";
-    item.status.selectedCandidateId = best.metadata.uid;
-    item.status.message = `Selected candidate ${best.metadata.uid} with score ${best.status.score?.value ?? 0}.`;
-    markCondition(item, "ReviewApproved", "True", bestReview?.summary ?? item.status.message);
+    const readinessBlockers = [
+      ...(finalDirty.length ? [`candidate worktree has unstaged or untracked changes: ${finalDirty.join(", ")}`] : []),
+      ...mergeReadinessBlockers(config, item, best.status.changedFiles, best)
+    ];
+    if (readinessBlockers.length > 0) {
+      item.status.phase = "Blocked";
+      item.status.failureReason = "MergeReadinessBlocked";
+      item.status.message = `Merge readiness blocked: ${readinessBlockers.join("; ")}`;
+      markCondition(item, "ReviewApproved", "True", bestReview?.summary ?? "Reviewer approved the candidate.");
+      markCondition(item, "MergeReady", "False", item.status.message);
+    } else {
+      best.status.phase = "Selected";
+      await writePatchCandidate(projectPath, best);
+      item.status.phase = "ReadyToMerge";
+      item.status.selectedCandidateId = best.metadata.uid;
+      item.status.message = `Selected candidate ${best.metadata.uid} with score ${best.status.score?.value ?? 0}.`;
+      markCondition(item, "ReviewApproved", "True", bestReview?.summary ?? item.status.message);
+      markCondition(item, "MergeReady", "True", item.status.message);
+    }
   } else if (best.status.reviewResult === "request_changes" && item.status.repairAttempts < config.retryPolicy.maxRepairAttempts) {
     item.status.phase = "Repairing";
     item.status.failureReason = "ReviewRequestedChanges";
@@ -525,6 +583,7 @@ async function runRepairer(
   });
   await writeAgentRun(projectPath, run);
   assertRunSucceeded(run);
+  await assertCandidateHeadUnmoved(projectPath, candidate, worktreePath, "repair");
   await cleanWorkerContext(projectPath, worktreePath);
   const materializedFiles = await materializeCandidate(projectPath, worktreePath);
   const scopeViolations = outsideAllowedPaths(item, materializedFiles);
@@ -561,6 +620,31 @@ async function runRepairer(
 }
 
 async function maybeMerge(projectPath: string, config: OrchestrationConfig, item: WorkItem): Promise<ReconcileResult> {
+  const candidate = await requireCandidate(projectPath, item);
+  const worktreePath = path.join(projectPath, candidate.spec.worktree);
+  await assertCandidateHeadUnmoved(projectPath, candidate, worktreePath, "merge");
+  const dirty = await unstagedOrUntrackedFiles(projectPath, worktreePath);
+  const files = await changedFiles(projectPath, worktreePath);
+  candidate.status.changedFiles = files;
+  candidate.status.diffStat = await diffStat(projectPath, worktreePath);
+  await writePatchCandidate(projectPath, candidate);
+  const readinessBlockers = [
+    ...(dirty.length ? [`candidate worktree has unstaged or untracked changes: ${dirty.join(", ")}`] : []),
+    ...mergeReadinessBlockers(config, item, files, candidate)
+  ];
+  if (readinessBlockers.length > 0) {
+    item.status.phase = "Blocked";
+    item.status.failureReason = "MergeReadinessBlocked";
+    item.status.message = `Merge readiness blocked: ${readinessBlockers.join("; ")}`;
+    markCondition(item, "MergeReady", "False", item.status.message);
+    await writeWorkItem(projectPath, item);
+    return {
+      workItemId: item.metadata.uid,
+      action: "merge_readiness_blocked",
+      phase: item.status.phase,
+      message: item.status.message
+    };
+  }
   if (!config.autoMerge.enabled) {
     item.status.message = "Candidate is ready to merge; auto-merge is disabled.";
     await writeWorkItem(projectPath, item);
@@ -572,20 +656,6 @@ async function maybeMerge(projectPath: string, config: OrchestrationConfig, item
     };
   }
   await assertMainWorktreeReady(projectPath);
-  const candidate = await requireCandidate(projectPath, item);
-  const worktreePath = path.join(projectPath, candidate.spec.worktree);
-  const dirty = await unstagedOrUntrackedFiles(projectPath, worktreePath);
-  if (dirty.length > 0) {
-    candidate.status.phase = "Rejected";
-    candidate.status.failureReason = "CandidateWorktreeDirty";
-    candidate.status.message = `Candidate has unstaged or untracked changes after validation: ${dirty.join(", ")}`;
-    await writePatchCandidate(projectPath, candidate);
-    throw new ForemanError("CandidateWorktreeDirty", candidate.status.message);
-  }
-  const files = await changedFiles(projectPath, worktreePath);
-  candidate.status.changedFiles = files;
-  candidate.status.diffStat = await diffStat(projectPath, worktreePath);
-  await writePatchCandidate(projectPath, candidate);
   const blocked = autoMergeBlockers(config, item, files, candidate);
   if (blocked.length > 0) {
     item.status.message = `Auto-merge blocked: ${blocked.join("; ")}`;
@@ -783,17 +853,71 @@ function parseValidationCommand(command: string): string[] {
 }
 
 function isAllowedValidationCommand(argv: string[], policy: OrchestrationConfig["validationPolicy"]): boolean {
-  const [cmd] = argv;
+  const [cmd, ...args] = argv;
   if (!cmd) return false;
   if (!policy.allowedExecutables.includes(cmd)) return false;
   const commandText = argv.join(" ");
-  return !policy.forbiddenArgPatterns.some((pattern) => {
+  if (policy.forbiddenArgPatterns.some((pattern) => {
     try {
       return new RegExp(pattern).test(commandText);
     } catch {
       return commandText.includes(pattern);
     }
-  });
+  })) return false;
+  return isAllowedValidationArgv(cmd, args);
+}
+
+function isAllowedValidationArgv(cmd: string, args: string[]): boolean {
+  if (["npm", "pnpm", "yarn", "bun"].includes(cmd)) return isAllowedPackageManagerCommand(cmd, args);
+  if (cmd === "pytest") return true;
+  if (cmd === "cargo") return args[0] === "test";
+  if (cmd === "go") return args[0] === "test";
+  if (cmd === "make") return ["test", "lint", "build"].includes(args[0] ?? "");
+  if (cmd === "git") return isReadOnlyGitCommand(args);
+  if (cmd === "node") return args.length === 1 && args[0] === "--version";
+  if (["turbo", "nx"].includes(cmd)) return args.some((arg) => ["test", "lint", "build"].includes(arg));
+  return false;
+}
+
+function isAllowedPackageManagerCommand(cmd: string, args: string[]): boolean {
+  const meaningful = stripPackageManagerOptions(cmd, args);
+  const [first, second] = meaningful;
+  if (cmd === "bun") {
+    return ["test", "lint", "build"].includes(first ?? "")
+      || (first === "run" && ["test", "lint", "build"].includes(second ?? ""));
+  }
+  return ["test", "lint", "build"].includes(first ?? "")
+    || (first === "run" && ["test", "lint", "build"].includes(second ?? ""));
+}
+
+function stripPackageManagerOptions(cmd: string, args: string[]): string[] {
+  const valueOptions = new Set(cmd === "pnpm"
+    ? ["--dir", "-C", "--filter"]
+    : cmd === "npm"
+      ? ["--prefix", "--workspace", "-w"]
+      : ["--cwd"]);
+  const result: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (!arg) continue;
+    if (arg.startsWith("--") && arg.includes("=")) continue;
+    if (valueOptions.has(arg)) {
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("-")) continue;
+    result.push(arg);
+  }
+  return result;
+}
+
+function isReadOnlyGitCommand(args: string[]): boolean {
+  const [subcommand, ...rest] = args;
+  if (!subcommand) return false;
+  if (["status", "rev-parse", "diff", "log", "show"].includes(subcommand)) {
+    return !rest.some((arg) => ["--output", "--ext-diff"].includes(arg) || arg.startsWith("--output="));
+  }
+  return false;
 }
 
 function scoreCandidate(
@@ -936,6 +1060,27 @@ function autoMergeBlockers(config: OrchestrationConfig, item: WorkItem, files: s
   return blockers;
 }
 
+function mergeReadinessBlockers(config: OrchestrationConfig, item: WorkItem, files: string[], candidate: PatchCandidate): string[] {
+  const blockers: string[] = [];
+  if (files.length > config.autoMerge.maxChangedFiles) blockers.push("too many changed files");
+  const protectedPatterns = [...config.protectedPaths, ...item.spec.protectedPaths];
+  const protectedHits = files.filter((file) => protectedPatterns.some((pattern) => matchesProtected(pattern, file)));
+  if (protectedHits.length > 0) blockers.push(`protected paths changed: ${protectedHits.join(", ")}`);
+  const dependencyHits = config.security.forbidDependencyChanges
+    ? files.filter((file) => config.security.dependencyFiles.some((dependencyFile) => file === dependencyFile || file.endsWith(`/${dependencyFile}`)))
+    : [];
+  if (dependencyHits.length > 0) blockers.push(`dependency files changed: ${dependencyHits.join(", ")}`);
+  const outsideAllowed = outsideAllowedPaths(item, files);
+  if (outsideAllowed.length > 0) blockers.push(`outside allowed paths: ${outsideAllowed.join(", ")}`);
+  if (candidate.status.validation.status !== "passed") {
+    blockers.push(`validation not passed: ${candidate.status.validation.status}`);
+  }
+  if (isValidationMutation(candidate.status.failureReason)) {
+    blockers.push(`validation mutated candidate snapshot: ${candidate.status.failureReason}`);
+  }
+  return blockers;
+}
+
 function matchesProtected(pattern: string, file: string): boolean {
   if (pattern.endsWith("/")) return file.startsWith(pattern);
   if (pattern.endsWith(".*")) return file === pattern.slice(0, -2) || file.startsWith(pattern.slice(0, -1));
@@ -951,6 +1096,28 @@ function matchesAllowedPath(pattern: string, file: string): boolean {
   if (pattern === ".") return true;
   if (pattern.endsWith("/")) return file.startsWith(pattern);
   return file === pattern || file.startsWith(`${pattern}/`);
+}
+
+function isValidationMutation(reason: string | undefined): boolean {
+  return reason === "ValidationMutatedWorktree" || reason === "ValidationMutatedIndex" || reason === "CandidateHeadMoved";
+}
+
+async function assertCandidateHeadUnmoved(
+  projectPath: string,
+  candidate: PatchCandidate,
+  worktreePath: string,
+  phase: string
+): Promise<void> {
+  if (!candidate.spec.baseHead) {
+    throw new ForemanError("CandidateBaseMissing", `Candidate ${candidate.metadata.uid} is missing baseHead; rerun implementation.`);
+  }
+  const head = await currentHead(projectPath, worktreePath);
+  if (head !== candidate.spec.baseHead) {
+    throw new ForemanError(
+      "CandidateHeadMoved",
+      `Candidate ${candidate.metadata.uid} HEAD moved during ${phase}: expected ${candidate.spec.baseHead}, got ${head}.`
+    );
+  }
 }
 
 function assertRunSucceeded(run: AgentRun): void {
@@ -972,6 +1139,7 @@ async function assertMainWorktreeReady(projectPath: string): Promise<void> {
   const unsafe = (await worktreeStatusEntries(projectPath, projectPath))
     .filter((entry) => {
       if (entry.path === planSource) return false;
+      if (isControllerRuntimeStatePath(entry.path)) return false;
       if (entry.code === "??" && isOrchestrationScaffoldingPath(entry.path)) return false;
       return true;
     })
@@ -979,6 +1147,17 @@ async function assertMainWorktreeReady(projectPath: string): Promise<void> {
   if (unsafe.length > 0) {
     throw new ForemanError("DirtyWorktree", `Main worktree has uncommitted non-orchestration changes: ${unsafe.join(", ")}`);
   }
+}
+
+function isControllerRuntimeStatePath(file: string): boolean {
+  return file.startsWith(".orchestration/workitems/")
+    || file.startsWith(".orchestration/candidates/")
+    || file.startsWith(".orchestration/runs/")
+    || file.startsWith(".orchestration/events/")
+    || file.startsWith(".orchestration/locks/")
+    || file.startsWith(".orchestration/leases/")
+    || file.startsWith(".orchestration/worktrees/")
+    || file.startsWith(".orchestration/dashboard/");
 }
 
 function isOrchestrationScaffoldingPath(file: string): boolean {
@@ -991,7 +1170,7 @@ function isOrchestrationScaffoldingPath(file: string): boolean {
     || file.includes(".orchestration.patch.");
 }
 
-async function installWorkerContext(projectPath: string, worktreePath: string): Promise<void> {
+async function installWorkerContext(projectPath: string, worktreePath: string): Promise<string[]> {
   await ignoreWorkerContext(worktreePath);
   const entries = [
     "AGENTS.md",
@@ -1002,14 +1181,29 @@ async function installWorkerContext(projectPath: string, worktreePath: string): 
     ".orchestration/knowledge",
     ".orchestration/schemas"
   ];
+  const copied: string[] = [];
   for (const entry of entries) {
     const source = path.join(projectPath, entry);
     const target = path.join(worktreePath, entry);
-    if ((await pathExists(source)) && !(await pathExists(target))) {
-      await ensureDir(path.dirname(target));
-      await cp(source, target, { recursive: true, force: false, errorOnExist: false });
-    }
+    await copyMissingTree(source, target, entry, copied);
   }
+  return copied;
+}
+
+async function copyMissingTree(source: string, target: string, relativePath: string, copied: string[]): Promise<void> {
+  if (!(await pathExists(source))) return;
+  const sourceStat = await stat(source);
+  if (sourceStat.isDirectory()) {
+    await ensureDir(target);
+    for (const entry of await readdir(source)) {
+      await copyMissingTree(path.join(source, entry), path.join(target, entry), `${relativePath}/${entry}`, copied);
+    }
+    return;
+  }
+  if (await pathExists(target)) return;
+  await ensureDir(path.dirname(target));
+  await cp(source, target, { recursive: false, force: false, errorOnExist: false });
+  copied.push(relativePath);
 }
 
 async function ignoreWorkerContext(worktreePath: string): Promise<void> {
@@ -1045,6 +1239,8 @@ async function runIntegrationValidation(
   try {
     await createDetachedWorktree(projectPath, worktreePath, mainHead);
     await mergeBranchInto(projectPath, worktreePath, candidateBranch);
+    const integrationHeadBefore = await currentHead(projectPath, worktreePath);
+    const cachedPatchBefore = await diff(projectPath, worktreePath);
     for (const command of item.spec.validationCommands) {
       const result = await runValidationCommand(command, worktreePath, config);
       logs.push(`$ ${command}\n${result.all ?? ""}\nexitCode=${result.exitCode}`);
@@ -1052,6 +1248,18 @@ async function runIntegrationValidation(
         await writeTextAtomic(logPath, `${logs.join("\n\n")}\n`);
         throw new ForemanError("IntegrationValidationFailed", `Integration validation failed before merge: ${command}`);
       }
+    }
+    const integrationHeadAfter = await currentHead(projectPath, worktreePath);
+    if (integrationHeadAfter !== integrationHeadBefore) {
+      logs.push(`Integration validation moved HEAD: expected ${integrationHeadBefore}, got ${integrationHeadAfter}.`);
+      await writeTextAtomic(logPath, `${logs.join("\n\n")}\n`);
+      throw new ForemanError("IntegrationValidationMovedHead", "Integration validation moved HEAD.");
+    }
+    const cachedPatchAfter = await diff(projectPath, worktreePath);
+    if (cachedPatchAfter !== cachedPatchBefore) {
+      logs.push("Integration validation changed the staged snapshot.");
+      await writeTextAtomic(logPath, `${logs.join("\n\n")}\n`);
+      throw new ForemanError("IntegrationValidationMutatedIndex", "Integration validation changed the staged snapshot.");
     }
     const dirty = await unstagedOrUntrackedFiles(projectPath, worktreePath);
     if (dirty.length > 0) {

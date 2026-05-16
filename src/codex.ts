@@ -151,6 +151,9 @@ function fakeOutput(request: CodexRunRequest): string {
         constraints: [],
         acceptanceCriteria: ["The requested behavior is implemented and relevant validation passes."],
         dependencies: [],
+        validationCommands: [],
+        contextPaths: [],
+        allowedPaths: [],
         risk: "medium"
       }]
     }, null, 2);

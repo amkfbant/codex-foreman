@@ -1,4 +1,4 @@
-import { readdir, readFile, stat } from "node:fs/promises";
+import { lstat, readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import type { AgentRun } from "../domain.js";
 import type { CodexExec } from "../codex.js";
@@ -33,11 +33,13 @@ export async function initCommand(projectPath: string, options: { codex?: CodexE
   }
   await writeTextAtomic(path.join(dir, "overview.md"), renderOverview(files, packageManagers, codexAnalysis));
   await writeTextAtomic(path.join(dir, "validation-matrix.md"), renderValidation(commands));
+  await writeTextAtomic(path.join(dir, "validation-catalog.json"), renderValidationCatalog(commands));
   await writeTextAtomic(path.join(dir, "package-map.xml"), renderPackageMap(files));
   await writeTextAtomic(path.join(dir, "risk-register.md"), renderRiskRegister(files, codexAnalysis));
   return [
     "wrote .orchestration/project/overview.md",
     "wrote .orchestration/project/validation-matrix.md",
+    "wrote .orchestration/project/validation-catalog.json",
     "wrote .orchestration/project/package-map.xml",
     "wrote .orchestration/project/risk-register.md",
     ...(options.codex ? ["wrote .orchestration/project/init-analysis.json"] : [])
@@ -52,18 +54,36 @@ type InitAnalysis = {
 };
 
 async function listProjectFiles(projectPath: string): Promise<string[]> {
-  const ignored = new Set([".git", "node_modules", "dist", ".orchestration", ".codex", ".agents"]);
+  const ignored = new Set([
+    ".git",
+    "node_modules",
+    "dist",
+    "build",
+    "coverage",
+    ".next",
+    ".turbo",
+    ".venv",
+    "target",
+    "vendor",
+    "tmp",
+    ".orchestration",
+    ".codex",
+    ".agents"
+  ]);
   const results: string[] = [];
-  async function walk(dir: string): Promise<void> {
+  async function walk(dir: string, depth = 0): Promise<void> {
+    if (depth > 8 || results.length >= 10_000) return;
     const entries = await readdir(dir);
     for (const entry of entries) {
       const full = path.join(dir, entry);
       const rel = path.relative(projectPath, full).replaceAll(path.sep, "/");
       if ([...ignored].some((ignoredPath) => rel === ignoredPath || rel.startsWith(`${ignoredPath}/`))) continue;
-      const stats = await stat(full);
+      const stats = await lstat(full);
+      if (stats.isSymbolicLink()) continue;
       if (stats.isDirectory()) {
-        await walk(full);
+        await walk(full, depth + 1);
       } else {
+        if (stats.size > 1_000_000) continue;
         results.push(rel);
       }
     }
@@ -135,6 +155,16 @@ function renderValidation(commands: string[]): string {
     "",
     ...commands.map((command) => `- \`${command}\``)
   ].join("\n") + "\n";
+}
+
+function renderValidationCatalog(commands: string[]): string {
+  return `${JSON.stringify({
+    commands: commands.map((command) => ({
+      command,
+      source: "init-detection",
+      confidence: "medium"
+    }))
+  }, null, 2)}\n`;
 }
 
 function renderPackageMap(files: string[]): string {

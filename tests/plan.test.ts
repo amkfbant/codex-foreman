@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { AgentRun } from "../src/domain.js";
 import { apiVersion } from "../src/domain.js";
 import type { CodexExec, CodexRunRequest } from "../src/codex.js";
+import { initCommand } from "../src/commands/init.js";
 import { installCommand } from "../src/commands/install.js";
 import { planCommand } from "../src/commands/plan.js";
 import { readPlan, readWorkItems } from "../src/state/store.js";
@@ -75,6 +76,23 @@ describe("plan command", () => {
     const second = items.find((item) => item.metadata.name === "second");
     expect(first).toBeTruthy();
     expect(second?.spec.dependencies).toEqual([first?.metadata.uid]);
+  });
+
+  it("uses init validation catalog when WorkItems do not specify validation", async () => {
+    const repo = await tempRepo();
+    await installCommand(repo, { mode: "existing", overwrite: "safe", maxCoders: 3, maxReviewers: 2 });
+    await writeTextAtomic(path.join(repo, "package.json"), `${JSON.stringify({
+      scripts: {
+        test: "node --version"
+      }
+    }, null, 2)}\n`);
+    await initCommand(repo);
+    await writeTextAtomic(path.join(repo, "feature.md"), "# Feature\n\n## Goal\nShip catalog-backed validation.\n");
+
+    await planCommand(repo, "feature.md");
+
+    const [item] = await readWorkItems(repo);
+    expect(item?.spec.validationCommands).toEqual(["npm test"]);
   });
 });
 

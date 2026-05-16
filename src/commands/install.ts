@@ -1,4 +1,4 @@
-import { mkdir, stat } from "node:fs/promises";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { isGitRepo } from "../git.js";
 import { schemasDir } from "../paths.js";
@@ -36,6 +36,10 @@ export async function installCommand(projectPath: string, options: InstallOption
     throw new ForemanError("NotGitRepo", `${projectPath} is not a git repository. Use --mode new after initializing git.`);
   }
   await ensureStateDirs(projectPath);
+  if (gitRepo) {
+    await updateGitInfoExclude(projectPath);
+    messages.push("updated .git/info/exclude for orchestration runtime state");
+  }
 
   const config = defaultConfig();
   config.defaults.maxCoders = options.maxCoders;
@@ -74,9 +78,28 @@ export async function installCommand(projectPath: string, options: InstallOption
   }
   await writeManagedFile(projectPath, ".orchestration/project/overview.md", "# Project Overview\n\nRun `codex-foreman init <project>` to populate this file.\n", options.overwrite, ".orchestration/project/overview.patch.md", messages);
   await writeManagedFile(projectPath, ".orchestration/project/validation-matrix.md", "# Validation Matrix\n\nRun `codex-foreman init <project>` to populate validation commands.\n", options.overwrite, ".orchestration/project/validation-matrix.patch.md", messages);
+  await writeManagedFile(projectPath, ".orchestration/project/validation-catalog.json", "{\n  \"commands\": []\n}\n", options.overwrite, ".orchestration/project/validation-catalog.patch.json", messages);
   await writeManagedFile(projectPath, ".orchestration/project/package-map.xml", "<PackageMap />\n", options.overwrite, ".orchestration/project/package-map.patch.xml", messages);
   await writeManagedFile(projectPath, ".orchestration/project/risk-register.md", "# Risk Register\n\nNo risks recorded yet.\n", options.overwrite, ".orchestration/project/risk-register.patch.md", messages);
   return messages;
+}
+
+async function updateGitInfoExclude(projectPath: string): Promise<void> {
+  const excludePath = path.join(projectPath, ".git", "info", "exclude");
+  if (!(await pathExists(excludePath))) return;
+  const additions = [
+    ".orchestration/workitems/",
+    ".orchestration/candidates/",
+    ".orchestration/runs/",
+    ".orchestration/events/",
+    ".orchestration/locks/",
+    ".orchestration/leases/",
+    ".orchestration/worktrees/",
+    ".orchestration/dashboard/"
+  ];
+  const existing = await readFile(excludePath, "utf8");
+  const next = [...new Set([...existing.split("\n").filter(Boolean), ...additions])].join("\n");
+  await writeFile(excludePath, `${next}\n`, "utf8");
 }
 
 async function ensureProject(projectPath: string, mode: InstallOptions["mode"]): Promise<void> {

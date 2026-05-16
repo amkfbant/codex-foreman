@@ -17,6 +17,7 @@ export function renderCoderPrompt(item: WorkItem): string {
 }
 
 export function renderReviewerPrompt(item: WorkItem, diffStat: string, diff: string, validationLog: string): string {
+  const renderedDiff = truncate(diff, 12_000);
   return [
     "You are the reviewer worker for Codex Foreman.",
     "Review this candidate patch against the WorkItem. Do not edit files.",
@@ -37,7 +38,7 @@ export function renderReviewerPrompt(item: WorkItem, diffStat: string, diff: str
     "",
     "Diff:",
     "```diff",
-    diff || "(no diff)",
+    renderedDiff || "(no diff)",
     "```",
     "",
     "Validation log:",
@@ -45,6 +46,11 @@ export function renderReviewerPrompt(item: WorkItem, diffStat: string, diff: str
     validationLog || "(no validation log)",
     "```"
   ].join("\n");
+}
+
+function truncate(value: string, maxChars: number): string {
+  if (value.length <= maxChars) return value;
+  return `${value.slice(0, maxChars)}\n\n[diff truncated after ${maxChars} characters; inspect changes.patch for the full patch]`;
 }
 
 export function renderRepairPrompt(item: WorkItem, review: ReviewReport | undefined, validationLog: string): string {
@@ -71,4 +77,3 @@ export function renderRepairPrompt(item: WorkItem, review: ReviewReport | undefi
     "After changes, summarize exact fixes and rerun relevant validation if possible."
   ].join("\n");
 }
-
